@@ -1,10 +1,11 @@
-name: Pure Binary Patch & Sign IPA
+name: Pure Binary Patch & SpoofBundle Dylib
 
 on:
   push:
     branches: [ main ]
     paths:
       - 'patch_engine.py'
+      - 'SpoofBundle.m'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -12,8 +13,35 @@ permissions:
   contents: write
 
 jobs:
+  build-dylib:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build SpoofBundle.dylib
+        run: |
+          xcrun clang -dynamiclib -arch arm64 \
+            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+            -miphoneos-version-min=15.0 \
+            -framework Foundation -framework UIKit \
+            -fobjc-arc -O2 \
+            SpoofBundle.m -o SpoofBundle.dylib
+          strip -x SpoofBundle.dylib
+          echo "=== Dylib 信息 ==="
+          ls -lh SpoofBundle.dylib
+          echo ""
+          echo "=== 依赖库 ==="
+          otool -L SpoofBundle.dylib
+
+      - name: Upload SpoofBundle.dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpoofBundle.dylib
+          path: SpoofBundle.dylib
+
   patch-and-sign:
     runs-on: macos-14
+    needs: build-dylib
 
     steps:
       - uses: actions/checkout@v4
@@ -58,12 +86,12 @@ jobs:
           rm -f "$APP_PATH/embedded.mobileprovision"
           find "$APP_PATH/Frameworks" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
 
-          # 清理所有历史 Dylib 残留（虽然新版本不注入，但防止旧 IPA 里有）
+          # 清理所有历史 Dylib 残留
           find "$APP_PATH" -iname "*patchzq*" -type f -delete 2>/dev/null || true
           find "$APP_PATH" -iname "libpatch*" -type f -delete 2>/dev/null || true
           find "$APP_PATH" -iname "*supreme*" -type f -delete 2>/dev/null || true
 
-      - name: Static Engine Patch (主二进制)
+      - name: Static Engine Patch
         if: steps.check.outputs.has_sign_config == 'true'
         env:
           PROV_BASE64: ${{ secrets.PROVISION_BASE64 }}
@@ -97,7 +125,7 @@ jobs:
 
           APP_PATH=$(find Payload_Workspace/Payload -name "*.app" -maxdepth 1 | head -1)
 
-          # 重签：锁定原包名 com.zhenqu.music，不修改 bundle id
+          # 重签：锁定原包名 com.zhenqu.music
           zsign -f -b "com.zhenqu.music" \
             -k cert.p12 -p "$P12_PASSWORD" -m profile.mobileprovision \
             -o Signed_Final.ipa "$APP_PATH"
