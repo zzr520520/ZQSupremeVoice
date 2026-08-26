@@ -24,9 +24,7 @@ jobs:
             -fobjc-arc -O2 \
             PatchZQ.m -o libPatchZQ.dylib
 
-          # 设置 install name 为 @rpath
           install_name_tool -id "@rpath/libPatchZQ.dylib" libPatchZQ.dylib
-
           strip -x libPatchZQ.dylib
           ls -lh libPatchZQ.dylib
           file libPatchZQ.dylib
@@ -85,26 +83,31 @@ jobs:
           APP_BINARY=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || basename "$APP_PATH" .app)
           echo "Binary: $APP_BINARY"
 
-          # 创建 Frameworks 目录并放入 dylib
-          mkdir -p "$APP_PATH/Frameworks"
-          cp libPatchZQ.dylib "$APP_PATH/Frameworks/"
+          # 清除可能残留的重名或带空格的 dylib
+          rm -f "$APP_PATH"/libPatchZQ*.dylib 2>/dev/null || true
+          rm -rf "$APP_PATH/Frameworks/libPatchZQ"*.dylib 2>/dev/null || true
 
-          # 使用 @rpath 注入 LC_LOAD_DYLIB
+          # 放到 Frameworks 目录（@rpath 标准路径）
+          mkdir -p "$APP_PATH/Frameworks"
+          cp libPatchZQ.dylib "$APP_PATH/Frameworks/libPatchZQ.dylib"
+
+          # 注入 LC_LOAD_DYLIB（@rpath 方式）
           python3 insert_dylib.py "$APP_PATH/$APP_BINARY" "@rpath/libPatchZQ.dylib"
 
           # 验证注入结果
-          otool -L "$APP_PATH/$APP_BINARY" | grep -i patch || echo "注入验证"
+          echo "=== 注入后 Load Commands ==="
+          otool -L "$APP_PATH/$APP_BINARY" | head -20
 
-          # 清理插件和签名冲突文件
+          # 清理无效组件（注意：保留 embedded.mobileprovision，由 dylib Hook 拦截读取）
           rm -rf "$APP_PATH/PlugIns"
           rm -rf "$APP_PATH/Watch"
           rm -rf "$APP_PATH/_CodeSignature"
           rm -rf "$APP_PATH/SC_Info"
-          rm -f "$APP_PATH/embedded.mobileprovision"
+          # embedded.mobileprovision 不删除！防止加固空指针崩溃
           find "$APP_PATH/Frameworks" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
 
-          # zsign 深层重签名（自动递归所有 Frameworks/dylib）
-          zsign -k cert.p12 -p "$P12_PASSWORD" -m profile.mobileprovision \
+          # zsign -f 强制全量覆盖签名（确保所有 Framework 与主二进制签名一致）
+          zsign -f -k cert.p12 -p "$P12_PASSWORD" -m profile.mobileprovision \
             -o signed_output.ipa "$APP_PATH"
 
           ls -lh signed_output.ipa

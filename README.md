@@ -4,20 +4,32 @@ iOS arm64 动态库，纯 Objective-C Runtime Swizzling 实现，兼容 iOS 15 ~
 
 ## 设计原则
 
-- **零 fishhook**：完全移除 C 符号重绑定（fishhook/rebind_symbols），避免 iOS 17 dyld4 的 __DATA_CONST 段保护崩溃
-- **纯 ObjC Swizzling**：仅使用 `method_setImplementation` 交换 OC 方法实现，安全稳定
-- **极简依赖**：仅依赖 Foundation + objc/runtime
+- **零 fishhook**：完全移除 C 符号重绑定，避免 iOS 17 dyld4 崩溃
+- **纯 ObjC Swizzling**：仅使用 `method_setImplementation`，安全稳定
+- **文件存在 + 内容为空**：保留 embedded.mobileprovision 文件存在，但 Hook 读取返回 nil，防止加固空指针崩溃
 
 ## 功能
 
 | Hook 目标 | 作用 |
 |----------|------|
-| `NSBundle.bundleIdentifier` | 伪装成原包 BundleID (`com.zhenqu.music`) |
-| `NSBundle.infoDictionary` | 替换字典中的 CFBundleIdentifier |
+| `NSBundle.bundleIdentifier` | 伪装原包 BundleID |
+| `NSBundle.infoDictionary` | 替换 CFBundleIdentifier |
 | `NSBundle.objectForInfoDictionaryKey:` | 拦截键值读取 |
 | `NSBundle.localizedInfoDictionary` | 本地化字典伪装 |
-| `NSFileManager.fileExistsAtPath:` | 隐藏签名相关文件 |
-| `NSFileManager.contentsAtPath:` | 阻止读取 mobileprovision / SC_Info 等 |
+| `NSData.dataWithContentsOfFile:` | 拦截 mobileprovision 读取 → 返回 nil |
+| `NSData.dataWithContentsOfFile:options:error:` | 同上，带错误信息 |
+| `NSFileManager.fileExistsAtPath:` | 隐藏 SC_Info / CodeResources |
+| `NSFileManager.contentsAtPath:` | 阻止读取签名相关文件 |
+
+### 关键策略：文件保留 + 读取拦截
+
+ZSE 等加固框架检测 `embedded.mobileprovision` 时：
+- 如果文件**不存在** → 空指针异常 → 崩溃
+- 如果文件**存在但读取为空** → 校验失败 → 可能触发自毁
+- 如果文件**存在且读取被拦截返回 nil** → 加固认为读取出错 → 跳过校验 ✅
+
+因此 `embedded.mobileprovision` 保留在包内，通过 Hook `NSData` 的读取接口返回 nil，
+同时 `NSFileManager.fileExistsAtPath:` 对 mobileprovision 路径仍返回 YES。
 
 ## 构建
 
@@ -28,58 +40,50 @@ GitHub Actions 自动编译，每次 push 到 main 自动发布 Release。
 ./build.sh
 ```
 
-## 注入方式
+## 注入与重签名
 
-### 使用 insert_dylib.py
 ```bash
-# 1. 解压 IPA
+# 1. 解压
 unzip app.ipa -d tmp
+APP_PATH=tmp/Payload/xxx.app
 
-# 2. 放到 Frameworks 目录
-mkdir -p tmp/Payload/xxx.app/Frameworks
-cp libPatchZQ.dylib tmp/Payload/xxx.app/Frameworks/
+# 2. 放入 Frameworks 目录
+mkdir -p "$APP_PATH/Frameworks"
+cp libPatchZQ.dylib "$APP_PATH/Frameworks/"
 
-# 3. 注入 @rpath 加载命令
-python3 insert_dylib.py tmp/Payload/xxx.app/xxx "@rpath/libPatchZQ.dylib"
+# 3. @rpath 注入
+python3 insert_dylib.py "$APP_PATH/xxx" "@rpath/libPatchZQ.dylib"
 
-# 4. 清理冲突文件
-rm -rf tmp/Payload/xxx.app/PlugIns
-rm -rf tmp/Payload/xxx.app/Watch
-rm -rf tmp/Payload/xxx.app/_CodeSignature
-rm -rf tmp/Payload/xxx.app/SC_Info
-rm -f tmp/Payload/xxx.app/embedded.mobileprovision
+# 4. 清理（保留 embedded.mobileprovision）
+rm -rf "$APP_PATH/PlugIns"
+rm -rf "$APP_PATH/Watch"
+rm -rf "$APP_PATH/_CodeSignature"
+rm -rf "$APP_PATH/SC_Info"
 
-# 5. zsign 重签名
-zsign -k cert.p12 -p password -m profile.mobileprovision -o signed.ipa tmp/Payload/xxx.app
+# 5. zsign -f 强制全量重签名
+zsign -f -k cert.p12 -p password -m profile.mobileprovision -o signed.ipa "$APP_PATH"
 ```
 
 ### GitHub Actions 自动重签名
-在仓库 Settings → Secrets 配置：
-- `P12_BASE64` — 证书 p12 的 base64
-- `P12_PASSWORD` — 证书密码
-- `PROVISION_BASE64` — 描述文件 base64
-- `IPA_URL` — 原始 IPA 下载链接
 
-触发 workflow_dispatch 或 push 到 main 即可自动完成全流程。
+在 Secrets 配置 `P12_BASE64` / `P12_PASSWORD` / `PROVISION_BASE64` / `IPA_URL` 后自动完成全流程。
 
 ## 文件结构
 
 ```
-├── PatchZQ.m               # 核心 Hook 代码（纯 ObjC Runtime）
+├── PatchZQ.m               # 核心 Hook（纯 ObjC Runtime）
 ├── insert_dylib.py         # Mach-O 注入脚本
 ├── build.sh                # 本地编译脚本
-├── .github/workflows/build.yml  # CI 构建 + 注入 + 重签名
+├── .github/workflows/build.yml  # CI
 └── README.md
 ```
 
-## 为什么不用 fishhook
+## 崩溃演进与修复历程
 
-iOS 17 的 dyld4 对 `__DATA_CONST` 段和符号表做了强化保护。传统 fishhook 在
-`_dyld_register_func_for_add_image` 回调中遍历系统镜像解析符号时，读取受保护内存
-会直接触发 `EXC_BAD_ACCESS (SIGSEGV)` 崩溃。
-
-纯 ObjC Runtime Swizzling 只操作 `class_getInstanceMethod` + `method_setImplementation`，
-完全在 OC 运行时的合法路径内，不会触及 dyld 的受保护段。
+| 阶段 | 崩溃位置 | 原因 | 修复方案 |
+|------|----------|------|----------|
+| 第一版 | Thread 0 启动 | fishhook + dyld4 段保护冲突 | 移除 fishhook，改用纯 ObjC Swizzling |
+| 第二版 | Thread 7 后台 | ZSE 反打包校验触发自毁 | Hook NSData 拦截 mobileprovision + 保留文件存在 |
 
 ## 免责声明
 
