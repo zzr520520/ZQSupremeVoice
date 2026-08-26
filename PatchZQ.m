@@ -1,25 +1,15 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <pthread.h>
-#import <signal.h>
-#import <string.h>
-#import <dlfcn.h>
+#import <dispatch/dispatch.h>
 
 #define TARGET_BUNDLE_ID @"com.zhenqu.music"
-
-// ========== 自毁地址特征 ==========
 #define SELF_DESTRUCT_PAGE 0xb5a00000
 
-// ========== 1. GCD 入口拦截（核心防护）==========
-// 直接拦截 dispatch_async_f，在自毁任务进入线程池前物理丢弃
+#pragma mark - 1. GCD 入口拦截（dyld __interpose 机制）
 // 不依赖 sigaction（会被 RTC 引擎的 PosixSignalHandler 覆盖）
-
-typedef void (*dispatch_async_f_t)(dispatch_queue_t, void *, void (*)(void *));
-
-static dispatch_async_f_t real_dispatch_async_f = NULL;
-static dispatch_async_f_t real_dispatch_async = NULL;
-static dispatch_async_f_t real_dispatch_sync = NULL;
-static dispatch_async_f_t real_dispatch_after_f = NULL;
+// 使用 __DATA,__interpose 段在 dyld 绑定层面替换 GCD 函数
+// dyld 会将其他镜像中对 original 的引用替换为 replacement
+// 但在本镜像内部对 original 的调用不会被替换，因此不会形成递归
 
 static BOOL is_destruct_func(uintptr_t addr) {
     if (addr == 0) return YES;
@@ -28,108 +18,61 @@ static BOOL is_destruct_func(uintptr_t addr) {
     return NO;
 }
 
-static void init_gcd_funcs(void) {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        real_dispatch_async_f = (dispatch_async_f_t)dlsym(RTLD_NEXT, "dispatch_async_f");
-        real_dispatch_async = (dispatch_async_f_t)dlsym(RTLD_NEXT, "dispatch_async");
-        real_dispatch_sync = (dispatch_async_f_t)dlsym(RTLD_NEXT, "dispatch_sync");
-        real_dispatch_after_f = (dispatch_async_f_t)dlsym(RTLD_NEXT, "dispatch_after_f");
-    });
-}
-
-// 拦截 dispatch_async_f
-void dispatch_async_f(dispatch_queue_t queue, void *context, void (*work)(void *)) {
-    init_gcd_funcs();
+// 替换 dispatch_async_f（C 函数指针版本）
+static void my_dispatch_async_f(dispatch_queue_t queue,
+                                void *context,
+                                dispatch_function_t work) {
     if (is_destruct_func((uintptr_t)work)) {
-        // 静默丢弃自毁任务
-        return;
+        return;  // 静默丢弃自毁任务
     }
-    real_dispatch_async_f(queue, context, work);
+    dispatch_async_f(queue, context, work);  // 调用原始实现
 }
 
-// 拦截 dispatch_async（Block 版本）
-void dispatch_async(dispatch_queue_t queue, void (^block)(void)) {
-    init_gcd_funcs();
-    // Block 的函数指针在 block->invoke
-    uintptr_t *blockRaw = (uintptr_t *)block;
-    if (blockRaw) {
-        // Block 结构体：isa(8) flags(4) reserved(4) invoke(8) ...
-        #if defined(__LP64__)
-        uintptr_t invoke = blockRaw[2];
-        #else
-        uintptr_t invoke = blockRaw[2];
-        #endif
+// 替换 dispatch_after_f（延迟派发版本）
+static void my_dispatch_after_f(dispatch_time_t when,
+                                dispatch_queue_t queue,
+                                void *context,
+                                dispatch_function_t work) {
+    if (is_destruct_func((uintptr_t)work)) {
+        return;  // 丢弃延迟自毁
+    }
+    dispatch_after_f(when, queue, context, work);
+}
+
+// 替换 dispatch_async（Block 版本）
+// 检查 Block 内部的 invoke 函数指针是否指向自毁页
+static void my_dispatch_async(dispatch_queue_t queue,
+                              dispatch_block_t block) {
+    if (block) {
+        // Block 结构体: isa(8) flags(4) reserved(4) invoke(8) ...
+        // 在 64 位系统上 invoke 位于偏移 16，即 uintptr_t 数组索引 2
+        void *raw = (__bridge void *)block;
+        uintptr_t *fields = (uintptr_t *)raw;
+        uintptr_t invoke = fields[2];
         if (is_destruct_func(invoke)) {
-            return; // 丢弃自毁 Block
+            return;  // 丢弃自毁 Block
         }
     }
-    // 用 dispatch_async_f 的原始实现来执行
-    real_dispatch_async_f(queue, block, _dispatch_call_block_and_release);
+    dispatch_async(queue, block);  // 调用原始实现
 }
 
-extern void _dispatch_call_block_and_release(void *);
+// dyld interpose 注册表
+// dyld 扫描此段，将所有其他镜像中对 original 的引用替换为 replacement
+__attribute__((used))
+static struct {
+    void *replacement;
+    void *original;
+} _zq_interpose_table[]
+__attribute__((section("__DATA,__interpose"))) = {
+    { (void *)my_dispatch_async_f, (void *)dispatch_async_f },
+    { (void *)my_dispatch_after_f,  (void *)dispatch_after_f  },
+    { (void *)my_dispatch_async,    (void *)dispatch_async    },
+};
 
-// 拦截 dispatch_sync_f（同步派发也可能被利用）
-void dispatch_sync_f(dispatch_queue_t queue, void *context, void (*work)(void *)) {
-    init_gcd_funcs();
-    if (is_destruct_func((uintptr_t)work)) {
-        return;
-    }
-    real_dispatch_sync(queue, context, work);
-}
-
-// 拦截 dispatch_after_f（延迟派发）
-void dispatch_after_f(dispatch_time_t when, dispatch_queue_t queue,
-                      void *context, void (*work)(void *)) {
-    init_gcd_funcs();
-    if (is_destruct_func((uintptr_t)work)) {
-        return; // 丢弃延迟自毁
-    }
-    real_dispatch_after_f(queue, context, work);
-}
-
-// ========== 2. 信号捕获（备用防线，低优先级）==========
-// 虽然会被 RTC 引擎覆盖，但在覆盖前能拦截早期的自毁
-
-static struct sigaction g_orig_sigsegv;
-static struct sigaction g_orig_sigbus;
-static struct sigaction g_orig_sigill;
-
-static void backup_sig_handler(int sig, siginfo_t *info, void *context) {
-    if (info) {
-        uintptr_t addr = (uintptr_t)info->si_addr;
-        if ((addr & 0xFFF00000) == SELF_DESTRUCT_PAGE || addr < 0x1000) {
-            pthread_exit(NULL);
-        }
-    }
-    struct sigaction *orig = NULL;
-    if (sig == SIGSEGV) orig = &g_orig_sigsegv;
-    else if (sig == SIGBUS) orig = &g_orig_sigbus;
-    else if (sig == SIGILL) orig = &g_orig_sigill;
-    if (orig && orig->sa_sigaction) {
-        orig->sa_sigaction(sig, info, context);
-    }
-}
-
-// 定期重新注册信号捕获（对抗 RTC 引擎覆盖）
-// 使用 dispatch_source 定时器，每 5 秒重新注册一次
-static void register_signal_handlers(void) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = backup_sig_handler;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-
-    sigaction(SIGSEGV, NULL, &g_orig_sigsegv);
-    sigaction(SIGBUS, NULL, &g_orig_sigbus);
-    sigaction(SIGILL, NULL, &g_orig_sigill);
-
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL);
-    sigaction(SIGILL, &sa, NULL);
-}
-
-// ========== 3. Bundle 伪装与路径保护 ==========
+#pragma mark - 2. Bundle 标识与路径规范
+// bundleIdentifier 返回固定目标 ID，绕过签名校验
+// bundleWithPath: 空值安全保护，使 _NSResolveSymlinksInPathUsingCache
+// 可以平稳穿透 lstat 路径检查
 
 static NSString *(*orig_bundleIdentifier)(id, SEL);
 static NSString *hook_bundleIdentifier(id self, SEL _cmd) {
@@ -139,8 +82,6 @@ static NSString *hook_bundleIdentifier(id self, SEL _cmd) {
     return orig_bundleIdentifier(self, _cmd);
 }
 
-// bundleWithPath: 空值安全保护
-// 防止加固逻辑在 lstat 路径解析时放置断点陷阱
 static NSBundle *(*orig_bundleWithPath)(id, SEL, NSString *);
 static NSBundle *hook_bundleWithPath(id self, SEL _cmd, NSString *path) {
     if (!path || [path length] == 0) {
@@ -149,56 +90,32 @@ static NSBundle *hook_bundleWithPath(id self, SEL _cmd, NSString *path) {
     return orig_bundleWithPath(self, _cmd, path);
 }
 
-// ========== 辅助函数 ==========
-
-static void swizzleInstanceMethod(Class cls, SEL origSel, IMP newImp, IMP *origImpOut) {
-    Method m = class_getInstanceMethod(cls, origSel);
+static void swizzle(Class cls, SEL orig, IMP hook, IMP *origOut) {
+    Method m = class_getInstanceMethod(cls, orig);
     if (m) {
-        *origImpOut = method_getImplementation(m);
-        method_setImplementation(m, newImp);
+        *origOut = method_getImplementation(m);
+        method_setImplementation(m, hook);
     }
 }
 
-static void swizzleClassMethod(Class cls, SEL origSel, IMP newImp, IMP *origImpOut) {
-    Method m = class_getClassMethod(cls, origSel);
+static void swizzleClass(Class cls, SEL orig, IMP hook, IMP *origOut) {
+    Method m = class_getClassMethod(cls, orig);
     if (m) {
-        *origImpOut = method_getImplementation(m);
-        method_setImplementation(m, newImp);
+        *origOut = method_getImplementation(m);
+        method_setImplementation(m, hook);
     }
 }
 
-// ========== 构造函数 ==========
+#pragma mark - 构造函数
+
 __attribute__((constructor(101)))
 static void patch_init(void) {
     @autoreleasepool {
-        // 预初始化 GCD 函数指针
-        init_gcd_funcs();
-
-        // 注册信号捕获（备用防线）
-        register_signal_handlers();
-
-        // 定时重新注册信号捕获，对抗 RTC PosixSignalHandler 覆盖
-        dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                                           dispatch_get_main_queue());
-        dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
-                                  5 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
-        dispatch_source_set_event_handler(timer, ^{
-            register_signal_handlers();
-        });
-        dispatch_resume(timer);
-
-        // Bundle 伪装
         Class bundleCls = [NSBundle class];
-        swizzleInstanceMethod(bundleCls,
-                              @selector(bundleIdentifier),
-                              (IMP)hook_bundleIdentifier,
-                              (IMP *)&orig_bundleIdentifier);
-
-        swizzleClassMethod(bundleCls,
-                           @selector(bundleWithPath:),
-                           (IMP)hook_bundleWithPath,
-                           (IMP *)&orig_bundleWithPath);
-
-        NSLog(@"[PatchZQ] GCD 拦截 + 信号备用 + Bundle 保护 已加载");
+        swizzle(bundleCls, @selector(bundleIdentifier),
+                (IMP)hook_bundleIdentifier, (IMP *)&orig_bundleIdentifier);
+        swizzleClass(bundleCls, @selector(bundleWithPath:),
+                     (IMP)hook_bundleWithPath, (IMP *)&orig_bundleWithPath);
+        NSLog(@"[PatchZQ] dyld interpose GCD + Bundle 保护 已加载");
     }
 }

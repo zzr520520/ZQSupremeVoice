@@ -15,6 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Tooling
+        run: |
+          brew install zsign || true
+          brew install optool || true
+
       - name: Compile Patch Dylib
         run: |
           xcrun -sdk iphoneos clang -dynamiclib -arch arm64 \
@@ -28,8 +33,10 @@ jobs:
           strip -x libPatchZQ.dylib
           ls -lh libPatchZQ.dylib
           file libPatchZQ.dylib
-          echo "=== 导出符号 ==="
-          nm -gU libPatchZQ.dylib
+
+          echo "=== 验证 __interpose 段 ==="
+          otool -l libPatchZQ.dylib | grep -A4 __interpose || echo "(未找到 __interpose 段！)"
+
           echo "=== 依赖库 ==="
           otool -L libPatchZQ.dylib
 
@@ -48,11 +55,6 @@ jobs:
           files: libPatchZQ.dylib
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install zsign
-        run: |
-          brew install zsign || true
-          zsign -h 2>&1 | head -10 || echo "zsign not available"
 
       - name: Check signing config
         id: check
@@ -87,15 +89,11 @@ jobs:
           echo "=== Frameworks ==="
           ls "$APP_PATH/Frameworks/" 2>/dev/null || echo "(none)"
 
-          # ---- 确认原始 IPA 干净 ----
-          if find "$APP_PATH" -name "*PatchZQ*" -type f | grep -q .; then
-            echo "警告：原始 IPA 中已存在 PatchZQ，正在清理..."
-            find "$APP_PATH" -name "*PatchZQ*" -type f -print -delete
-          else
-            echo "原始 IPA 干净，无 PatchZQ 残留"
-          fi
+          # ---- 确认原始 IPA 干净：删除任何残留 PatchZQ ----
+          find "$APP_PATH" -name "*PatchZQ*" -type f -print -delete 2>/dev/null || true
+          rm -f "$APP_PATH"/libPatchZQ*.dylib
 
-          # ---- 剥离 ZSE.framework ----
+          # ---- 剥离 ZSE.framework（如果存在）----
           if [ -d "$APP_PATH/Frameworks/ZSE.framework" ]; then
             echo ""
             echo ">>> 剥离 ZSE.framework..."
@@ -104,24 +102,25 @@ jobs:
             echo "ZSE.framework 已删除"
           fi
 
-          # ---- 注入单一干净 dylib（@executable_path）----
+          # ---- 拷贝单一干净 dylib 到 .app 根目录 ----
           cp libPatchZQ.dylib "$APP_PATH/libPatchZQ.dylib"
-          python3 insert_dylib.py "$APP_PATH/$APP_BINARY" "@executable_path/libPatchZQ.dylib"
-          echo ""
-          echo "Dylib 注入完成"
+
+          # ---- 用 optool 写入 Load Command ----
+          optool install -c load \
+            -p "@executable_path/libPatchZQ.dylib" \
+            -t "$APP_PATH/$APP_BINARY"
 
           echo ""
           echo "=== 验证注入（确保只有一个 PatchZQ）==="
+          otool -L "$APP_PATH/$APP_BINARY" | grep -i patch || echo "(未找到 PatchZQ)"
           PATCH_COUNT=$(find "$APP_PATH" -name "*PatchZQ*" -type f | wc -l)
           echo "PatchZQ 文件数: $PATCH_COUNT"
-          otool -L "$APP_PATH/$APP_BINARY" | grep -i patch || echo "(未找到)"
 
-          # ---- 清理冲突组件 ----
+          # ---- 清理所有扩展和可能引发证书权限冲突的签名残留 ----
           rm -rf "$APP_PATH/PlugIns"
           rm -rf "$APP_PATH/Watch"
           rm -rf "$APP_PATH/_CodeSignature"
           rm -rf "$APP_PATH/SC_Info"
-          # 删除 embedded.mobileprovision（本版不再需要文件存在）
           rm -f "$APP_PATH/embedded.mobileprovision"
           find "$APP_PATH/Frameworks" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
 
@@ -141,6 +140,7 @@ jobs:
 
           APP_PATH=$(find Payload_Workspace/Payload -name "*.app" -maxdepth 1 | head -1)
 
+          # 强制覆盖签名并锁定原包名
           zsign -f -b "com.zhenqu.music" \
             -k cert.p12 -p "$P12_PASSWORD" -m profile.mobileprovision \
             -o Signed_Final.ipa "$APP_PATH"
