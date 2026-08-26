@@ -1,22 +1,18 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <dispatch/dispatch.h>
+#import <dlfcn.h>
 
 #define TARGET_BUNDLE_ID @"com.zhenqu.music"
 
 #pragma mark - Block 结构体定义
-
-struct Block_descriptor {
-    unsigned long int reserved;
-    unsigned long int size;
-};
 
 struct Block_layout {
     void *isa;
     volatile int32_t flags;
     int32_t reserved;
     void (*invoke)(void *, ...);
-    struct Block_descriptor *descriptor;
+    void *descriptor;
 };
 
 #pragma mark - 自毁地址检测
@@ -36,10 +32,13 @@ static BOOL is_destruct_func(uintptr_t addr) {
 // 本镜像内部对 original 的调用不被替换，因此不会递归
 
 // Layer 1: 拦截 dispatch_async_f（C 函数指针版本）
-// 主二进制通过 dispatch_async_f(queue, ctx, 0xb5a00000) 派发自毁时拦截
 static void my_dispatch_async_f(dispatch_queue_t queue,
                                 void *context,
                                 dispatch_function_t work) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSLog(@"[PatchZQ] dispatch_async_f interpose ACTIVE");
+    });
     if (is_destruct_func((uintptr_t)work)) {
         NSLog(@"[PatchZQ] BLOCKED dispatch_async_f self-destruct: work=%p", work);
         return;
@@ -63,6 +62,10 @@ static void my_dispatch_after_f(dispatch_time_t when,
 // 检查 Block 内部的 invoke 函数指针
 static void my_dispatch_async(dispatch_queue_t queue,
                               dispatch_block_t block) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSLog(@"[PatchZQ] dispatch_async interpose ACTIVE");
+    });
     if (block) {
         struct Block_layout *layout = (struct Block_layout *)(__bridge void *)block;
         uintptr_t invoke = (uintptr_t)layout->invoke;
@@ -75,38 +78,16 @@ static void my_dispatch_async(dispatch_queue_t queue,
     dispatch_async(queue, block);
 }
 
-// Layer 2: 拦截 _dispatch_call_block_and_release（Block 执行入口）
-// 这是 dispatch 系统在 worker 线程中实际调用 Block 的函数
-// 即使主二进制绕过公开 API 直接将 Block 推入队列，
-// 执行时也必然经过此函数
-extern void _dispatch_call_block_and_release(void *block);
-static void my_dispatch_call_block_and_release(void *block) {
-    if (block) {
-        struct Block_layout *layout = (struct Block_layout *)block;
-        uintptr_t invoke = (uintptr_t)layout->invoke;
-        if (is_destruct_func(invoke)) {
-            NSLog(@"[PatchZQ] BLOCKED _dispatch_call_block_and_release self-destruct: invoke=%p",
-                  (void *)invoke);
-            // 释放 Block 避免内存泄漏
-            extern void _Block_release(const void *);
-            _Block_release(block);
-            return;
-        }
-    }
-    _dispatch_call_block_and_release(block);
-}
-
-// dyld interpose 注册表
+// dyld interpose 注册表（仅含导出符号，_dispatch_call_block_and_release 未导出）
 __attribute__((used))
 static struct {
     void *replacement;
     void *original;
 } _zq_interpose_table[]
 __attribute__((section("__DATA,__interpose"))) = {
-    { (void *)my_dispatch_async_f,                (void *)dispatch_async_f },
-    { (void *)my_dispatch_after_f,                 (void *)dispatch_after_f  },
-    { (void *)my_dispatch_async,                   (void *)dispatch_async    },
-    { (void *)my_dispatch_call_block_and_release,   (void *)_dispatch_call_block_and_release },
+    { (void *)my_dispatch_async_f, (void *)dispatch_async_f },
+    { (void *)my_dispatch_after_f,  (void *)dispatch_after_f  },
+    { (void *)my_dispatch_async,    (void *)dispatch_async    },
 };
 
 #pragma mark - Bundle 伪装
@@ -156,6 +137,11 @@ static void swizzleClass(Class cls, SEL orig, IMP hook, IMP *origOut) {
 __attribute__((constructor(101)))
 static void patch_init(void) {
     @autoreleasepool {
+        // 诊断：检查 _dispatch_call_block_and_release 是否可通过 dlsym 找到
+        // 该函数是 libdispatch 内部 Block 执行入口，未在 iOS SDK 中导出
+        void *call_block = dlsym(RTLD_DEFAULT, "_dispatch_call_block_and_release");
+        NSLog(@"[PatchZQ] _dispatch_call_block_and_release = %p", call_block);
+
         Class bundleCls = [NSBundle class];
         swizzle(bundleCls, @selector(bundleIdentifier),
                 (IMP)hook_bundleIdentifier, (IMP *)&orig_bundleIdentifier);
@@ -163,6 +149,6 @@ static void patch_init(void) {
                 (IMP)hook_objectForInfoDictionaryKey, (IMP *)&orig_objectForInfoDictionaryKey);
         swizzleClass(bundleCls, @selector(bundleWithPath:),
                      (IMP)hook_bundleWithPath, (IMP *)&orig_bundleWithPath);
-        NSLog(@"[PatchZQ] interpose GCD (async_f/after_f/async/call_block) + Bundle 保护 已加载");
+        NSLog(@"[PatchZQ] interpose GCD (async_f/after_f/async) + Bundle 保护 已加载");
     }
 }
