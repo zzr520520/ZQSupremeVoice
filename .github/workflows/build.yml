@@ -29,7 +29,7 @@ jobs:
           ls -lh libPatchZQ.dylib
           file libPatchZQ.dylib
           echo "=== 导出符号 ==="
-          nm -gU libPatchZQ.dylib | head -20
+          nm -gU libPatchZQ.dylib | head -30
           echo "=== 依赖库 ==="
           otool -L libPatchZQ.dylib
 
@@ -52,7 +52,7 @@ jobs:
       - name: Install zsign
         run: |
           brew install zsign || true
-          zsign -v 2>&1 || echo "zsign not available"
+          zsign -h 2>&1 | head -20 || echo "zsign not available"
 
       - name: Check signing config
         id: check
@@ -67,63 +67,66 @@ jobs:
       - name: Download IPA
         if: steps.check.outputs.has_sign_config == 'true'
         run: |
+          rm -rf Payload_Dir signed_output.ipa app.ipa
           curl -L -o app.ipa "${{ secrets.IPA_URL }}"
           ls -lh app.ipa
 
-      - name: Strip ZSE & Inject dylib
+      - name: Extract & Clean & Inject
         if: steps.check.outputs.has_sign_config == 'true'
         run: |
+          rm -rf Payload_Dir
           unzip -q app.ipa -d Payload_Dir
           APP_PATH=$(find Payload_Dir/Payload -name "*.app" -maxdepth 1 | head -1)
           echo "App: $APP_PATH"
 
           APP_BINARY=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || basename "$APP_PATH" .app)
           echo "Binary: $APP_BINARY"
+          echo "原 BundleID: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist" 2>/dev/null || echo 'unknown')"
 
           echo ""
           echo "=== Frameworks ==="
           ls "$APP_PATH/Frameworks/" 2>/dev/null || echo "(none)"
 
-          # ---- 方案A：剥离 ZSE.framework ----
+          # ---- 彻底清除所有历史 dylib 副本（防止 libPatchZQ 4.dylib 累积）----
+          echo ""
+          echo ">>> 清理历史 dylib 残留..."
+          find "$APP_PATH" -name "*PatchZQ*" -type f -print -delete 2>/dev/null || true
+          find "$APP_PATH/Frameworks" -name "*PatchZQ*" -type f -print -delete 2>/dev/null || true
+          echo "清理完成"
+
+          # ---- 剥离 ZSE.framework ----
           if [ -d "$APP_PATH/Frameworks/ZSE.framework" ]; then
             echo ""
-            echo ">>> 发现 ZSE.framework，开始剥离..."
+            echo ">>> 剥离 ZSE.framework..."
             python3 remove_dylib_dep.py "$APP_PATH/$APP_BINARY" "ZSE" || true
             rm -rf "$APP_PATH/Frameworks/ZSE.framework"
             echo "ZSE.framework 已删除"
-          else
-            echo "未找到 ZSE.framework"
           fi
 
-          # ---- 清理历史 dylib 残留 ----
-          rm -f "$APP_PATH"/libPatchZQ*.dylib 2>/dev/null || true
-          rm -f "$APP_PATH/Frameworks"/libPatchZQ*.dylib 2>/dev/null || true
-          echo ""
-          echo "已清理历史 dylib 残留"
-
-          # ---- 注入补丁 dylib ----
+          # ---- 注入单一干净 dylib ----
           mkdir -p "$APP_PATH/Frameworks"
           cp libPatchZQ.dylib "$APP_PATH/Frameworks/libPatchZQ.dylib"
           python3 insert_dylib.py "$APP_PATH/$APP_BINARY" "@rpath/libPatchZQ.dylib"
+          echo ""
           echo "Dylib 注入完成"
 
           echo ""
-          echo "=== 验证注入 ==="
-          otool -L "$APP_PATH/$APP_BINARY" | grep -i patch || echo "(未找到)"
+          echo "=== 验证注入结果 ==="
+          otool -L "$APP_PATH/$APP_BINARY" | grep -i patch || echo "(未找到 patch dylib)"
 
           # ---- 清理冲突组件 ----
           rm -rf "$APP_PATH/PlugIns"
           rm -rf "$APP_PATH/Watch"
           rm -rf "$APP_PATH/_CodeSignature"
           rm -rf "$APP_PATH/SC_Info"
-          # 保留 embedded.mobileprovision（由 dylib C 层拦截 open/stat）
+          # 保留 embedded.mobileprovision（由 dylib 拦截）
           find "$APP_PATH/Frameworks" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
 
           echo ""
           echo "=== 最终 App 大小 ==="
           du -sh "$APP_PATH"
 
-      - name: Sign IPA with zsign
+      - name: Sign IPA with zsign (-b 强制原包名)
         if: steps.check.outputs.has_sign_config == 'true'
         env:
           P12_BASE64: ${{ secrets.P12_BASE64 }}
@@ -135,7 +138,10 @@ jobs:
 
           APP_PATH=$(find Payload_Dir/Payload -name "*.app" -maxdepth 1 | head -1)
 
-          zsign -f -k cert.p12 -p "$P12_PASSWORD" -m profile.mobileprovision \
+          # -f 强制全量覆盖签名
+          # -b 强制保持原包名 com.zhenqu.music（防止 BundleID 变化触发自毁）
+          zsign -f -b "com.zhenqu.music" \
+            -k cert.p12 -p "$P12_PASSWORD" -m profile.mobileprovision \
             -o signed_output.ipa "$APP_PATH"
 
           ls -lh signed_output.ipa
