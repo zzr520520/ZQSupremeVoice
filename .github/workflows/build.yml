@@ -1,4 +1,4 @@
-name: Build Dylib, Inject and Sign IPA
+name: Build Dylib & Sign IPA
 
 on:
   push:
@@ -9,16 +9,13 @@ permissions:
   contents: write
 
 jobs:
-  build-dylib:
+  build:
     runs-on: macos-14
-    outputs:
-      dylib_name: ${{ steps.build.outputs.dylib_name }}
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Compile arm64 Dylib
-        id: build
         run: |
           xcrun -sdk iphoneos clang -dynamiclib -arch arm64 \
             -isysroot $(xcrun -sdk iphoneos --show-sdk-path) \
@@ -31,14 +28,15 @@ jobs:
           strip -x libPatchZQ.dylib
           ls -lh libPatchZQ.dylib
           file libPatchZQ.dylib
-          echo "dylib_name=libPatchZQ.dylib" >> "$GITHUB_OUTPUT"
+          otool -L libPatchZQ.dylib
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
         with:
           name: libPatchZQ
           path: libPatchZQ.dylib
 
-      - name: Release Dylib
+      - name: Release
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v1
         with:
@@ -48,85 +46,59 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  sign-ipa:
-    needs: build-dylib
-    runs-on: macos-14
-    if: ${{ secrets.P12_BASE64 != '' }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: libPatchZQ
-
-      - name: Install tools
+      - name: Install zsign
         run: |
-          brew install zsign
+          brew install zsign || echo "zsign install failed (optional for dylib-only build)"
 
-          # 安装 optool
-          git clone https://github.com/alexzielenski/optool.git /tmp/optool
-          cd /tmp/optool && git submodule update --init --recursive
-          xcodebuild -project optool.xcodeproj -scheme optool -configuration Release CONFIGURATION_BUILD_DIR=/tmp/optool/build
-          cp /tmp/optool/build/optool /usr/local/bin/optool
-          optool --version || true
-
-      - name: Download IPA
+      - name: Check signing config
+        id: check
         run: |
-          if [ -n "${{ secrets.IPA_URL }}" ]; then
-            echo "下载 IPA..."
-            curl -L -o app.ipa "${{ secrets.IPA_URL }}"
-            ls -lh app.ipa
+          if [ -n "${{ secrets.P12_BASE64 }}" ] && [ -n "${{ secrets.IPA_URL }}" ]; then
+            echo "has_sign_config=true" >> "$GITHUB_OUTPUT"
           else
-            echo "未配置 IPA_URL secret，跳过重签名步骤"
-            echo "skip_sign=true" >> "$GITHUB_ENV"
+            echo "has_sign_config=false" >> "$GITHUB_OUTPUT"
+            echo "未配置签名 secrets，跳过重签名"
           fi
 
+      - name: Download IPA
+        if: steps.check.outputs.has_sign_config == 'true'
+        run: |
+          curl -L -o app.ipa "${{ secrets.IPA_URL }}"
+          ls -lh app.ipa
+
       - name: Inject dylib and sign
-        if: env.skip_sign != 'true'
+        if: steps.check.outputs.has_sign_config == 'true'
         env:
           P12_BASE64: ${{ secrets.P12_BASE64 }}
           P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
           PROV_BASE64: ${{ secrets.PROVISION_BASE64 }}
         run: |
-          # 准备证书
           echo "$P12_BASE64" | base64 -d > cert.p12
           echo "$PROV_BASE64" | base64 -d > profile.mobileprovision
 
-          # 解压 IPA
           unzip -q app.ipa -d Payload_Dir
           APP_PATH=$(find Payload_Dir/Payload -name "*.app" -maxdepth 1 | head -1)
-          echo "App 路径: $APP_PATH"
-          ls "$APP_PATH/"
+          echo "App: $APP_PATH"
 
-          # 获取主二进制名称
           APP_BINARY=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || basename "$APP_PATH" .app)
-          echo "主二进制: $APP_BINARY"
+          echo "Binary: $APP_BINARY"
 
-          # 复制 dylib 到 App 目录
           cp libPatchZQ.dylib "$APP_PATH/"
+          python3 insert_dylib.py "$APP_PATH/$APP_BINARY" "@executable_path/libPatchZQ.dylib"
 
-          # 注入 Load Command
-          optool install -c load -p "@executable_path/libPatchZQ.dylib" -t "$APP_PATH/$APP_BINARY" || echo "optool 注入失败，尝试替代方案"
-
-          # 清理插件和签名垃圾（个人证书不支持 Extension / Watch / App Groups）
           rm -rf "$APP_PATH/PlugIns"
           rm -rf "$APP_PATH/Watch"
           rm -rf "$APP_PATH/_CodeSignature"
           rm -rf "$APP_PATH/SC_Info"
-
-          # 递归清理 Frameworks 中的 _CodeSignature
           find "$APP_PATH/Frameworks" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
 
-          # 使用 zsign 重签名（自动递归所有 Frameworks 和 dylib）
           zsign -k cert.p12 -p "$P12_PASSWORD" -m profile.mobileprovision \
-            -o signed_output.ipa \
-            "$APP_PATH"
+            -o signed_output.ipa "$APP_PATH"
 
           ls -lh signed_output.ipa
 
       - name: Upload Signed IPA
-        if: env.skip_sign != 'true'
+        if: steps.check.outputs.has_sign_config == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: Signed-IPA
