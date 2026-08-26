@@ -12,7 +12,7 @@ xcrun -sdk iphoneos clang -dynamiclib -arch arm64 \
   -fobjc-arc -O2 \
   PatchZQ.m -o libPatchZQ.dylib
 
-install_name_tool -id "@rpath/libPatchZQ.dylib" libPatchZQ.dylib
+install_name_tool -id "@executable_path/libPatchZQ.dylib" libPatchZQ.dylib
 strip -x libPatchZQ.dylib
 
 echo ""
