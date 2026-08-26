@@ -24,10 +24,15 @@ jobs:
             -fobjc-arc -O2 \
             PatchZQ.m -o libPatchZQ.dylib
 
+          # 设置 install_name
           install_name_tool -id "@rpath/libPatchZQ.dylib" libPatchZQ.dylib
+
           strip -x libPatchZQ.dylib
           ls -lh libPatchZQ.dylib
           file libPatchZQ.dylib
+          echo "=== 导出符号 ==="
+          nm -gU libPatchZQ.dylib | head -20
+          echo "=== 依赖库 ==="
           otool -L libPatchZQ.dylib
 
       - name: Upload dylib
@@ -46,9 +51,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install zsign
+      - name: Install tools
         run: |
-          brew install zsign || echo "zsign install failed (optional for dylib-only build)"
+          brew install zsign || true
+          echo "zsign: $(zsign -v 2>&1 || echo 'not available')"
 
       - name: Check signing config
         id: check
@@ -66,7 +72,122 @@ jobs:
           curl -L -o app.ipa "${{ secrets.IPA_URL }}"
           ls -lh app.ipa
 
-      - name: Inject dylib and sign
+      - name: Prepare & Inject & Strip ZSE
+        if: steps.check.outputs.has_sign_config == 'true'
+        run: |
+          unzip -q app.ipa -d Payload_Dir
+          APP_PATH=$(find Payload_Dir/Payload -name "*.app" -maxdepth 1 | head -1)
+          echo "App: $APP_PATH"
+
+          APP_BINARY=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || basename "$APP_PATH" .app)
+          echo "Binary: $APP_BINARY"
+
+          echo ""
+          echo "=== 原始 Frameworks 列表 ==="
+          ls "$APP_PATH/Frameworks/" 2>/dev/null || echo "(none)"
+
+          # ---- 方案A：剥离 ZSE.framework（安全加固/反作弊库）----
+          if [ -d "$APP_PATH/Frameworks/ZSE.framework" ]; then
+            echo "发现 ZSE.framework，正在剥离..."
+
+            # 先从主二进制移除 ZSE 依赖
+            # 使用 insert_dylib 的反向操作：查找并移除 LC_LOAD_DYLIB
+            python3 -c "
+import struct, sys
+
+app_path = '$APP_PATH/$APP_BINARY'
+target_name = 'ZSE.framework/ZSE'
+
+with open(app_path, 'rb') as f:
+    data = bytearray(f.read())
+
+magic = struct.unpack_from('<I', data, 0)[0]
+if magic == 0xfeedfacf:  # MH_MAGIC_64
+    hdr_size = 32
+    ncmds_offset = 16
+    sizeofcmds_offset = 24
+else:
+    print('Unsupported magic:', hex(magic))
+    sys.exit(0)
+
+ncmds = struct.unpack_from('<I', data, ncmds_offset)[0]
+sizeofcmds = struct.unpack_from('<I', data, sizeofcmds_offset)[0]
+
+offset = hdr_size
+removed = 0
+for i in range(ncmds):
+    cmd = struct.unpack_from('<I', data, offset)[0]
+    cmdsize = struct.unpack_from('<I', data, offset + 4)[0]
+
+    # LC_LOAD_DYLIB = 0xC, LC_LOAD_WEAK_DYLIB = 0x18
+    if cmd == 0x0C or cmd == 0x18 or cmd == 0x8000000C or cmd == 0x80000018:
+        # dylib name offset = cmd + cmdsize + offset (4 bytes from struct start)
+        name_offset = struct.unpack_from('<I', data, offset + 8)[0]  # offset in union dylib
+        name_addr = offset + name_offset
+        # 读取名称字符串
+        name_end = data.index(b'\x00', name_addr)
+        name = data[name_addr:name_end].decode('utf-8', errors='replace')
+        if target_name in name or 'ZSE' in name:
+            print(f'  移除 ZSE 依赖: {name}')
+            # 删除该 load command
+            del data[offset:offset + cmdsize]
+            removed += 1
+            ncmds -= 1
+            sizeofcmds -= cmdsize
+            continue
+
+    offset += cmdsize
+
+if removed > 0:
+    struct.pack_into('<I', data, ncmds_offset, ncmds)
+    struct.pack_into('<I', data, sizeofcmds_offset, sizeofcmds)
+    with open(app_path, 'wb') as f:
+        f.write(data)
+    print(f'已移除 {removed} 个 ZSE 相关 load command')
+else:
+    print('主二进制未链接 ZSE.framework')
+"
+
+            # 删除 ZSE.framework 目录
+            rm -rf "$APP_PATH/Frameworks/ZSE.framework"
+            echo "ZSE.framework 已删除"
+          else
+            echo "未找到 ZSE.framework"
+          fi
+
+          # ---- 清理历史 dylib 残留 ----
+          rm -f "$APP_PATH"/libPatchZQ*.dylib 2>/dev/null || true
+          rm -f "$APP_PATH/Frameworks"/libPatchZQ*.dylib 2>/dev/null || true
+          echo "已清理历史 dylib 残留"
+
+          # ---- 注入补丁 dylib ----
+          mkdir -p "$APP_PATH/Frameworks"
+          cp libPatchZQ.dylib "$APP_PATH/Frameworks/libPatchZQ.dylib"
+
+          python3 insert_dylib.py "$APP_PATH/$APP_BINARY" "@rpath/libPatchZQ.dylib"
+          echo "Dylib 注入完成"
+
+          echo ""
+          echo "=== 注入后 Load Commands 中 PatchZQ 验证 ==="
+          otool -L "$APP_PATH/$APP_BINARY" | grep -i patch || echo "(未找到，检查注入)"
+
+          echo ""
+          echo "=== 处理后 Frameworks 列表 ==="
+          ls "$APP_PATH/Frameworks/" 2>/dev/null || echo "(none)"
+
+          # ---- 清理冲突组件 ----
+          rm -rf "$APP_PATH/PlugIns"
+          rm -rf "$APP_PATH/Watch"
+          rm -rf "$APP_PATH/_CodeSignature"
+          rm -rf "$APP_PATH/SC_Info"
+          # 保留 embedded.mobileprovision（由 dylib 拦截读取）
+          find "$APP_PATH/Frameworks" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
+
+          echo ""
+          echo "=== 最终 App 目录大小 ==="
+          du -sh "$APP_PATH"
+
+      - name: Sign IPA with zsign
         if: steps.check.outputs.has_sign_config == 'true'
         env:
           P12_BASE64: ${{ secrets.P12_BASE64 }}
@@ -76,37 +197,9 @@ jobs:
           echo "$P12_BASE64" | base64 -d > cert.p12
           echo "$PROV_BASE64" | base64 -d > profile.mobileprovision
 
-          unzip -q app.ipa -d Payload_Dir
           APP_PATH=$(find Payload_Dir/Payload -name "*.app" -maxdepth 1 | head -1)
-          echo "App: $APP_PATH"
 
-          APP_BINARY=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || basename "$APP_PATH" .app)
-          echo "Binary: $APP_BINARY"
-
-          # 清除可能残留的重名或带空格的 dylib
-          rm -f "$APP_PATH"/libPatchZQ*.dylib 2>/dev/null || true
-          rm -rf "$APP_PATH/Frameworks/libPatchZQ"*.dylib 2>/dev/null || true
-
-          # 放到 Frameworks 目录（@rpath 标准路径）
-          mkdir -p "$APP_PATH/Frameworks"
-          cp libPatchZQ.dylib "$APP_PATH/Frameworks/libPatchZQ.dylib"
-
-          # 注入 LC_LOAD_DYLIB（@rpath 方式）
-          python3 insert_dylib.py "$APP_PATH/$APP_BINARY" "@rpath/libPatchZQ.dylib"
-
-          # 验证注入结果
-          echo "=== 注入后 Load Commands ==="
-          otool -L "$APP_PATH/$APP_BINARY" | head -20
-
-          # 清理无效组件（注意：保留 embedded.mobileprovision，由 dylib Hook 拦截读取）
-          rm -rf "$APP_PATH/PlugIns"
-          rm -rf "$APP_PATH/Watch"
-          rm -rf "$APP_PATH/_CodeSignature"
-          rm -rf "$APP_PATH/SC_Info"
-          # embedded.mobileprovision 不删除！防止加固空指针崩溃
-          find "$APP_PATH/Frameworks" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
-
-          # zsign -f 强制全量覆盖签名（确保所有 Framework 与主二进制签名一致）
+          # zsign -f 强制全量覆盖签名
           zsign -f -k cert.p12 -p "$P12_PASSWORD" -m profile.mobileprovision \
             -o signed_output.ipa "$APP_PATH"
 
