@@ -37,6 +37,9 @@ jobs:
           echo "=== 验证 __interpose 段 ==="
           otool -l libPatchZQ.dylib | grep -A4 __interpose || echo "(未找到 __interpose 段！)"
 
+          echo "=== 导出符号 ==="
+          nm -gU libPatchZQ.dylib
+
           echo "=== 依赖库 ==="
           otool -L libPatchZQ.dylib
 
@@ -73,41 +76,67 @@ jobs:
           curl -L -o original.ipa "${{ secrets.IPA_URL }}"
           ls -lh original.ipa
 
-      - name: Clean Inject (从原始 IPA 全新注入)
+      - name: Clean Inject (零残留注入)
         if: steps.check.outputs.has_sign_config == 'true'
         run: |
-          rm -rf Payload_Workspace
+          # ---- 0. 绝对干净的工作区 ----
+          rm -rf Payload_Workspace Signed_Final.ipa
           unzip -q original.ipa -d Payload_Workspace
           APP_PATH=$(find Payload_Workspace/Payload -name "*.app" -maxdepth 1 | head -1)
-          echo "App: $APP_PATH"
-
           APP_BINARY=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || basename "$APP_PATH" .app)
+          echo "App: $APP_PATH"
           echo "Binary: $APP_BINARY"
           echo "原 BundleID: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist" 2>/dev/null || echo 'unknown')"
 
+          # ---- 1. 暴力清理所有历史 PatchZQ 文件 ----
+          # 递归查找整个 .app 目录下任何包含 PatchZQ 的文件
           echo ""
-          echo "=== 清理所有历史注入 ==="
-          # 删除所有历史 PatchZQ 文件（包括子目录）
-          find "$APP_PATH" -name "*PatchZQ*" -type f -print -delete 2>/dev/null || true
-          rm -f "$APP_PATH"/libPatchZQ*.dylib
-          # 删除所有带编号的历史 dylib（如 libPatchZQ 2.dylib, libPatchZQ 3.dylib 等）
-          find "$APP_PATH" -name "libPatchZQ*" -type f -print -delete 2>/dev/null || true
+          echo "=== 清理前 PatchZQ 相关文件 ==="
+          find "$APP_PATH" -iname "*patchzq*" -type f -print 2>/dev/null || echo "(无)"
 
-          # 检查并清理已存在的 Load Command
-          echo "=== 清理旧 Load Command ==="
-          EXISTING_LC=$(otool -L "$APP_PATH/$APP_BINARY" | grep -ci "patchzq" || echo "0")
-          if [ "$EXISTING_LC" -gt 0 ]; then
-            echo "发现 $EXISTING_LC 个旧 PatchZQ Load Command，正在清理..."
-            # 用 optool uninstall 逐个移除
-            optool uninstall -p "@executable_path/libPatchZQ.dylib" -t "$APP_PATH/$APP_BINARY" 2>/dev/null || true
-            for i in 2 3 4 5 6 7 8 9; do
-              optool uninstall -p "@executable_path/libPatchZQ $i.dylib" -t "$APP_PATH/$APP_BINARY" 2>/dev/null || true
-            done
-          else
-            echo "原始 IPA 无 PatchZQ Load Command"
-          fi
+          find "$APP_PATH" -iname "*patchzq*" -type f -print -delete 2>/dev/null || true
+          find "$APP_PATH" -iname "libpatch*" -type f -print -delete 2>/dev/null || true
 
-          # ---- 剥离 ZSE.framework（如果存在）----
+          # 同时清理 Frameworks 下可能藏的 dylib
+          find "$APP_PATH/Frameworks" -iname "*patch*" -type f -print -delete 2>/dev/null || true
+
+          echo ""
+          echo "=== 清理后 PatchZQ 相关文件 ==="
+          find "$APP_PATH" -iname "*patchzq*" -type f -print 2>/dev/null || echo "(已清空)"
+
+          # ---- 2. 暴力清理所有 PatchZQ Load Command ----
+          # 先列出所有包含 patch 的 Load Command
+          echo ""
+          echo "=== 清理前 Load Command 中 PatchZQ 条目 ==="
+          otool -L "$APP_PATH/$APP_BINARY" | grep -i "patch" || echo "(无)"
+
+          # 尝试用 optool uninstall 移除所有可能的路径
+          # 覆盖各种可能的历史注入路径格式
+          for lc_path in \
+            "@executable_path/libPatchZQ.dylib" \
+            "@executable_path/Frameworks/libPatchZQ.dylib" \
+            "@rpath/libPatchZQ.dylib" \
+            "libPatchZQ.dylib" \
+            "@executable_path/libPatchZQ 2.dylib" \
+            "@executable_path/libPatchZQ 3.dylib" \
+            "@executable_path/libPatchZQ 4.dylib" \
+            "@executable_path/libPatchZQ 5.dylib" \
+            "@executable_path/libPatchZQ 6.dylib" \
+            "@executable_path/libPatchZQ 7.dylib" \
+            "@executable_path/libPatchZQ 8.dylib" \
+            "@executable_path/libPatchZQ 9.dylib" \
+            "@executable_path/Frameworks/libPatchZQ 2.dylib" \
+            "@executable_path/Frameworks/libPatchZQ 3.dylib" \
+            "@executable_path/Frameworks/libPatchZQ 4.dylib" \
+            "@loader_path/libPatchZQ.dylib"; do
+            optool uninstall -p "$lc_path" -t "$APP_PATH/$APP_BINARY" 2>/dev/null || true
+          done
+
+          echo ""
+          echo "=== 清理后 Load Command 中 PatchZQ 条目 ==="
+          otool -L "$APP_PATH/$APP_BINARY" | grep -i "patch" || echo "(已清空)"
+
+          # ---- 3. 剥离 ZSE.framework（如果存在）----
           if [ -d "$APP_PATH/Frameworks/ZSE.framework" ]; then
             echo ""
             echo ">>> 剥离 ZSE.framework..."
@@ -116,27 +145,39 @@ jobs:
             echo "ZSE.framework 已删除"
           fi
 
-          # ---- 拷贝单一干净 dylib 到 .app 根目录 ----
+          # ---- 4. 注入唯一干净 dylib ----
           cp libPatchZQ.dylib "$APP_PATH/libPatchZQ.dylib"
-
-          # ---- 用 optool 写入 Load Command ----
           optool install -c load \
             -p "@executable_path/libPatchZQ.dylib" \
             -t "$APP_PATH/$APP_BINARY"
 
+          # ---- 5. 严格验证注入结果（不通过则直接失败）----
           echo ""
-          echo "=== 验证注入（确保只有一个 PatchZQ）==="
+          echo "=== 注入验证 ==="
+
           LC_COUNT=$(otool -L "$APP_PATH/$APP_BINARY" | grep -ci "patchzq" || echo "0")
-          echo "PatchZQ Load Command 数: $LC_COUNT"
-          FILE_COUNT=$(find "$APP_PATH" -name "*PatchZQ*" -type f | wc -l)
-          echo "PatchZQ 文件数: $FILE_COUNT"
-          if [ "$LC_COUNT" -ne 1 ] || [ "$FILE_COUNT" -ne 1 ]; then
-            echo "错误：PatchZQ 注入异常！LC=$LC_COUNT FILE=$FILE_COUNT"
+          echo "PatchZQ Load Command 数量: $LC_COUNT"
+
+          FILE_COUNT=$(find "$APP_PATH" -iname "*patchzq*" -type f | wc -l)
+          echo "PatchZQ 文件数量: $FILE_COUNT"
+
+          if [ "$LC_COUNT" -ne 1 ]; then
+            echo "❌ 失败：Load Command 数量不为 1（当前: $LC_COUNT）"
+            echo "Load Command 详情："
+            otool -L "$APP_PATH/$APP_BINARY" | grep -i "patch"
             exit 1
           fi
-          echo "注入验证通过：仅 1 个 Load Command + 1 个文件"
 
-          # ---- 清理所有扩展和可能引发证书权限冲突的签名残留 ----
+          if [ "$FILE_COUNT" -ne 1 ]; then
+            echo "❌ 失败：文件数量不为 1（当前: $FILE_COUNT）"
+            echo "文件列表："
+            find "$APP_PATH" -iname "*patchzq*" -type f
+            exit 1
+          fi
+
+          echo "✅ 注入验证通过：1 个 Load Command + 1 个 dylib 文件"
+
+          # ---- 6. 清理冲突组件 ----
           rm -rf "$APP_PATH/PlugIns"
           rm -rf "$APP_PATH/Watch"
           rm -rf "$APP_PATH/_CodeSignature"
@@ -160,7 +201,6 @@ jobs:
 
           APP_PATH=$(find Payload_Workspace/Payload -name "*.app" -maxdepth 1 | head -1)
 
-          # 强制覆盖签名并锁定原包名
           zsign -f -b "com.zhenqu.music" \
             -k cert.p12 -p "$P12_PASSWORD" -m profile.mobileprovision \
             -o Signed_Final.ipa "$APP_PATH"
