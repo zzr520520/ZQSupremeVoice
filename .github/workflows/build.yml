@@ -1,0 +1,51 @@
+name: Build Dylib
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile arm64 Dylib
+        run: |
+          xcrun -sdk iphoneos clang -dynamiclib -arch arm64 \
+            -isysroot $(xcrun -sdk iphoneos --show-sdk-path) \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -framework Foundation \
+            -framework UIKit \
+            -framework AudioToolbox \
+            -framework CoreFoundation \
+            Tweak.m -o libZQSupremeVoice.dylib
+
+      - name: Verify
+        run: |
+          ls -lh libZQSupremeVoice.dylib
+          file libZQSupremeVoice.dylib
+          otool -L libZQSupremeVoice.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libZQSupremeVoice
+          path: libZQSupremeVoice.dylib
+
+      - name: Release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build #${{ github.run_number }}
+          files: libZQSupremeVoice.dylib
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
