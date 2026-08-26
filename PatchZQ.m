@@ -15,6 +15,7 @@ static NSString *const kOriginalBundleID = @"com.zhenqu.music";
 static NSString *(*orig_bundleIdentifier)(id, SEL);
 static NSDictionary *(*orig_infoDictionary)(id, SEL);
 
+static int (*orig_ptrace)(int request, pid_t pid, caddr_t addr, int data);
 static FILE *(*orig_fopen)(const char *, const char *);
 static int (*orig_open)(const char *, int, ...);
 
@@ -42,7 +43,9 @@ static int my_ptrace(int request, pid_t pid, caddr_t addr, int data) {
     if (request == 31) { // PT_DENY_ATTACH
         return 0;
     }
-    // 其他 ptrace 请求直接返回 0 模拟成功
+    if (orig_ptrace) {
+        return orig_ptrace(request, pid, addr, data);
+    }
     return 0;
 }
 
@@ -113,7 +116,7 @@ static void patch_init(void) {
 
         // --- fishhook 替换 C 函数符号 ---
         struct rebinding rebindings[] = {
-            {"ptrace", (void *)my_ptrace, (void **)&orig_ptrace ? NULL : NULL},
+            {"ptrace", (void *)my_ptrace, (void **)&orig_ptrace},
             {"fopen", (void *)my_fopen, (void **)&orig_fopen},
             {"open", (void *)my_open, (void **)&orig_open},
         };

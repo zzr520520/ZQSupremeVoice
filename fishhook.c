@@ -102,8 +102,7 @@ static void rebind_symbols_for_image(const struct mach_header *header,
   }
 }
 
-static void _dyld_callback(const struct mach_header *mh, intptr_t vmaddr_slide, void *context) {
-  (void)context;
+static void _dyld_callback(const struct mach_header *mh, intptr_t vmaddr_slide) {
   rebind_symbols_for_image(mh, vmaddr_slide);
 }
 
@@ -116,7 +115,7 @@ int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel) {
   qsort(_rebindings, _rebindings_nel, sizeof(struct rebinding), cmp_rebinding);
 
   // 注册 dyld 回调，处理已加载和未来加载的镜像
-  _dyld_register_func_for_add_image(&_dyld_callback, NULL);
+  _dyld_register_func_for_add_image(&_dyld_callback);
 
   return 0;
 }
