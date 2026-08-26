@@ -1,12 +1,10 @@
-name: Binary Patch + Keychain Dylib & Sign IPA
+name: Pure Binary Patch & Sign IPA
 
 on:
   push:
     branches: [ main ]
     paths:
-      - 'PatchZQ.m'
-      - 'patch_macho.py'
-      - 'patch_ipa_v3.py'
+      - 'patch_engine.py'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -23,27 +21,6 @@ jobs:
       - name: Install Tooling
         run: |
           brew install zsign || true
-
-      - name: Compile Keychain Patch Dylib
-        run: |
-          xcrun clang -dynamiclib -arch arm64 \
-            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-            -miphoneos-version-min=15.0 \
-            -framework Foundation -framework Security \
-            -fobjc-arc -O2 \
-            PatchZQ.m -o libPatchZQ.dylib
-          strip -x libPatchZQ.dylib
-          echo "=== Dylib 信息 ==="
-          ls -lh libPatchZQ.dylib
-          echo ""
-          echo "=== 验证 __interpose 段 ==="
-          otool -l libPatchZQ.dylib | grep -A4 __interpose || echo "未找到 __interpose 段"
-
-      - name: Upload Dylib (单独下载)
-        uses: actions/upload-artifact@v4
-        with:
-          name: libPatchZQ.dylib
-          path: libPatchZQ.dylib
 
       - name: Check signing config
         id: check
@@ -71,12 +48,7 @@ jobs:
           APP_BINARY=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || basename "$APP_PATH" .app)
           echo "App: $APP_PATH"
           echo "Binary: $APP_BINARY"
-          echo "原 BundleID: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist" 2>/dev/null || echo 'unknown')"
-
-          # 清除所有历史 Dylib 注入残留
-          find "$APP_PATH" -iname "*patchzq*" -type f -delete 2>/dev/null || true
-          find "$APP_PATH" -iname "libpatch*" -type f -delete 2>/dev/null || true
-          find "$APP_PATH" -iname "*supreme*" -type f -delete 2>/dev/null || true
+          echo "原 BundleID: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist' 2>/dev/null || echo 'unknown')"
 
           # 清理个人证书无法签名的插件与扩展
           rm -rf "$APP_PATH/PlugIns"
@@ -86,7 +58,12 @@ jobs:
           rm -f "$APP_PATH/embedded.mobileprovision"
           find "$APP_PATH/Frameworks" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
 
-      - name: Static Binary Patch (All Frameworks)
+          # 清理所有历史 Dylib 残留（虽然新版本不注入，但防止旧 IPA 里有）
+          find "$APP_PATH" -iname "*patchzq*" -type f -delete 2>/dev/null || true
+          find "$APP_PATH" -iname "libpatch*" -type f -delete 2>/dev/null || true
+          find "$APP_PATH" -iname "*supreme*" -type f -delete 2>/dev/null || true
+
+      - name: Static Engine Patch (主二进制)
         if: steps.check.outputs.has_sign_config == 'true'
         env:
           PROV_BASE64: ${{ secrets.PROVISION_BASE64 }}
@@ -104,61 +81,9 @@ jobs:
           APP_PATH=$(find Payload_Workspace/Payload -name "*.app" -maxdepth 1 | head -1)
           APP_BINARY=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || basename "$APP_PATH" .app)
 
-          # 修补主二进制
           echo ""
           echo "=== 修补主二进制 ==="
-          python3 patch_macho.py "$APP_PATH/$APP_BINARY" "$TEAM_ID"
-
-          # 修补所有 Framework
-          echo ""
-          echo "=== 修补 Frameworks ==="
-          for fw in "$APP_PATH"/Frameworks/*.framework; do
-            [ -d "$fw" ] || continue
-            fw_name=$(basename "$fw" .framework)
-            fw_bin="$fw/$fw_name"
-            if [ -f "$fw_bin" ]; then
-              count=$(python3 patch_macho.py "$fw_bin" "$TEAM_ID" 2>&1 | grep "Total Team ID strings replaced" | awk '{print $NF}')
-              if [ -n "$count" ] && [ "$count" -gt 0 ] 2>/dev/null; then
-                echo "  ✓ $fw_name: $count 处"
-              fi
-            fi
-          done
-
-      - name: Inject Keychain Patch Dylib
-        if: steps.check.outputs.has_sign_config == 'true'
-        run: |
-          APP_PATH=$(find Payload_Workspace/Payload -name "*.app" -maxdepth 1 | head -1)
-          APP_BINARY=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || basename "$APP_PATH" .app)
-
-          # 先清理旧的 Load Command
-          for name in \
-            "@executable_path/libPatchZQ.dylib" \
-            "@executable_path/libPatchZQ 2.dylib" \
-            "@executable_path/libPatchZQ 3.dylib" \
-            "@executable_path/libPatchZQ 4.dylib" \
-            "@executable_path/libPatchZQ 5.dylib" \
-            "@executable_path/libZQSupremeVoice.dylib" \
-            "@rpath/libPatchZQ.dylib" \
-            ; do
-            optool uninstall -p "$name" -t "$APP_PATH/$APP_BINARY" 2>/dev/null || true
-          done
-
-          # 拷贝并注入
-          cp libPatchZQ.dylib "$APP_PATH/libPatchZQ.dylib"
-          optool install -c load -p "@executable_path/libPatchZQ.dylib" -t "$APP_PATH/$APP_BINARY"
-
-          # 验证注入
-          echo ""
-          echo "=== 注入验证 ==="
-          LC_COUNT=$(otool -L "$APP_PATH/$APP_BINARY" | grep -c "libPatchZQ" || echo 0)
-          FILE_COUNT=$(find "$APP_PATH" -name "libPatchZQ*.dylib" | wc -l | tr -d ' ')
-          echo "Load Command 中 libPatchZQ 数量: $LC_COUNT"
-          echo "文件系统中 libPatchZQ 数量: $FILE_COUNT"
-          if [ "$LC_COUNT" -ne 1 ] || [ "$FILE_COUNT" -ne 1 ]; then
-            echo "❌ 注入异常！LC=$LC_COUNT FILE=$FILE_COUNT"
-            exit 1
-          fi
-          echo "✅ 注入成功"
+          python3 patch_engine.py "$APP_PATH/$APP_BINARY" "$TEAM_ID"
 
       - name: Sign IPA with zsign
         if: steps.check.outputs.has_sign_config == 'true'
@@ -172,7 +97,7 @@ jobs:
 
           APP_PATH=$(find Payload_Workspace/Payload -name "*.app" -maxdepth 1 | head -1)
 
-          # 重签：锁定原包名 + 递归签名所有 Framework + 签名注入的 dylib
+          # 重签：锁定原包名 com.zhenqu.music，不修改 bundle id
           zsign -f -b "com.zhenqu.music" \
             -k cert.p12 -p "$P12_PASSWORD" -m profile.mobileprovision \
             -o Signed_Final.ipa "$APP_PATH"
