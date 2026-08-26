@@ -1,4 +1,4 @@
-name: Build Dylib & Sign IPA
+name: Build Dylib & Clean Sign
 
 on:
   push:
@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compile arm64 Dylib
+      - name: Compile Minimal Dylib
         run: |
           xcrun -sdk iphoneos clang -dynamiclib -arch arm64 \
             -isysroot $(xcrun -sdk iphoneos --show-sdk-path) \
@@ -29,7 +29,7 @@ jobs:
           ls -lh libPatchZQ.dylib
           file libPatchZQ.dylib
           echo "=== 导出符号 ==="
-          nm -gU libPatchZQ.dylib | head -30
+          nm -gU libPatchZQ.dylib
           echo "=== 依赖库 ==="
           otool -L libPatchZQ.dylib
 
@@ -52,7 +52,7 @@ jobs:
       - name: Install zsign
         run: |
           brew install zsign || true
-          zsign -h 2>&1 | head -20 || echo "zsign not available"
+          zsign -h 2>&1 | head -10 || echo "zsign not available"
 
       - name: Check signing config
         id: check
@@ -64,19 +64,20 @@ jobs:
             echo "未配置签名 secrets，跳过重签名"
           fi
 
-      - name: Download IPA
+      - name: Download Original IPA
         if: steps.check.outputs.has_sign_config == 'true'
         run: |
-          rm -rf Payload_Dir signed_output.ipa app.ipa
-          curl -L -o app.ipa "${{ secrets.IPA_URL }}"
-          ls -lh app.ipa
+          rm -rf Payload_Workspace Signed_ZQMusic.ipa original.ipa
+          curl -L -o original.ipa "${{ secrets.IPA_URL }}"
+          ls -lh original.ipa
 
-      - name: Extract & Clean & Inject
+      - name: Clean Inject (从原始 IPA 全新注入)
         if: steps.check.outputs.has_sign_config == 'true'
         run: |
-          rm -rf Payload_Dir
-          unzip -q app.ipa -d Payload_Dir
-          APP_PATH=$(find Payload_Dir/Payload -name "*.app" -maxdepth 1 | head -1)
+          # 每次全新解压，绝不复用已有 Payload，防止累积
+          rm -rf Payload_Workspace
+          unzip -q original.ipa -d Payload_Workspace
+          APP_PATH=$(find Payload_Workspace/Payload -name "*.app" -maxdepth 1 | head -1)
           echo "App: $APP_PATH"
 
           APP_BINARY=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || basename "$APP_PATH" .app)
@@ -84,17 +85,18 @@ jobs:
           echo "原 BundleID: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist" 2>/dev/null || echo 'unknown')"
 
           echo ""
-          echo "=== Frameworks ==="
+          echo "=== 原始 Frameworks ==="
           ls "$APP_PATH/Frameworks/" 2>/dev/null || echo "(none)"
 
-          # ---- 彻底清除所有历史 dylib 副本（防止 libPatchZQ 4.dylib 累积）----
-          echo ""
-          echo ">>> 清理历史 dylib 残留..."
-          find "$APP_PATH" -name "*PatchZQ*" -type f -print -delete 2>/dev/null || true
-          find "$APP_PATH/Frameworks" -name "*PatchZQ*" -type f -print -delete 2>/dev/null || true
-          echo "清理完成"
+          # ---- 确认原始 IPA 不含 PatchZQ（干净输入）----
+          if find "$APP_PATH" -name "*PatchZQ*" -type f | grep -q .; then
+            echo "警告：原始 IPA 中已存在 PatchZQ，正在清理..."
+            find "$APP_PATH" -name "*PatchZQ*" -type f -print -delete
+          else
+            echo "原始 IPA 干净，无 PatchZQ 残留"
+          fi
 
-          # ---- 剥离 ZSE.framework ----
+          # ---- 剥离 ZSE.framework（可选）----
           if [ -d "$APP_PATH/Frameworks/ZSE.framework" ]; then
             echo ""
             echo ">>> 剥离 ZSE.framework..."
@@ -111,20 +113,23 @@ jobs:
           echo "Dylib 注入完成"
 
           echo ""
-          echo "=== 验证注入结果 ==="
+          echo "=== 验证（确保只有一个 PatchZQ）==="
+          PATCH_COUNT=$(find "$APP_PATH" -name "*PatchZQ*" -type f | wc -l)
+          echo "PatchZQ 文件数: $PATCH_COUNT"
           otool -L "$APP_PATH/$APP_BINARY" | grep -i patch || echo "(未找到 patch dylib)"
 
-          # ---- 清理冲突组件 ----
+          # ---- 清理冲突组件（保留 Assets.car 和所有资源完整）----
           rm -rf "$APP_PATH/PlugIns"
           rm -rf "$APP_PATH/Watch"
           rm -rf "$APP_PATH/_CodeSignature"
           rm -rf "$APP_PATH/SC_Info"
-          # 保留 embedded.mobileprovision（由 dylib 拦截）
           find "$APP_PATH/Frameworks" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
+          # embedded.mobileprovision 保留（由信号捕获防护自毁）
 
           echo ""
-          echo "=== 最终 App 大小 ==="
+          echo "=== 最终目录大小 ==="
           du -sh "$APP_PATH"
+          du -sh "$APP_PATH/Assets.car" 2>/dev/null || echo "(无 Assets.car)"
 
       - name: Sign IPA with zsign (-b 强制原包名)
         if: steps.check.outputs.has_sign_config == 'true'
@@ -136,19 +141,19 @@ jobs:
           echo "$P12_BASE64" | base64 -d > cert.p12
           echo "$PROV_BASE64" | base64 -d > profile.mobileprovision
 
-          APP_PATH=$(find Payload_Dir/Payload -name "*.app" -maxdepth 1 | head -1)
+          APP_PATH=$(find Payload_Workspace/Payload -name "*.app" -maxdepth 1 | head -1)
 
           # -f 强制全量覆盖签名
-          # -b 强制保持原包名 com.zhenqu.music（防止 BundleID 变化触发自毁）
+          # -b 强制保持原包名 com.zhenqu.music
           zsign -f -b "com.zhenqu.music" \
             -k cert.p12 -p "$P12_PASSWORD" -m profile.mobileprovision \
-            -o signed_output.ipa "$APP_PATH"
+            -o Signed_ZQMusic.ipa "$APP_PATH"
 
-          ls -lh signed_output.ipa
+          ls -lh Signed_ZQMusic.ipa
 
       - name: Upload Signed IPA
         if: steps.check.outputs.has_sign_config == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: Signed-IPA
-          path: signed_output.ipa
+          name: Signed-ZQMusic
+          path: Signed_ZQMusic.ipa
