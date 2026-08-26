@@ -11,10 +11,11 @@ xcrun -sdk iphoneos clang -dynamiclib -arch arm64 \
   -fobjc-arc \
   -framework Foundation \
   -framework UIKit \
-  -framework AudioToolbox \
-  -framework CoreFoundation \
-  Tweak.m -o libZQSupremeVoice.dylib
+  PatchZQ.m fishhook.c -o libPatchZQ.dylib
 
-echo "Build success: libZQSupremeVoice.dylib"
-file libZQSupremeVoice.dylib
-ls -lh libZQSupremeVoice.dylib
+strip -x libPatchZQ.dylib
+
+echo ""
+echo "Build success: libPatchZQ.dylib"
+file libPatchZQ.dylib
+ls -lh libPatchZQ.dylib

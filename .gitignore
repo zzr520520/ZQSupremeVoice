@@ -1,2 +1,7 @@
 *.dylib
+*.ipa
+*.p12
+*.mobileprovision
+Payload_Dir/
+tmp/
 .DS_Store
