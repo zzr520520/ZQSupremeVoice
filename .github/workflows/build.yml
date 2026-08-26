@@ -1,4 +1,4 @@
-name: Build Dylib & Clean Sign
+name: Binary Patch & Sign IPA
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  patch-and-sign:
     runs-on: macos-14
 
     steps:
@@ -18,55 +18,15 @@ jobs:
       - name: Install Tooling
         run: |
           brew install zsign || true
-          brew install optool || true
-
-      - name: Compile Patch Dylib
-        run: |
-          xcrun -sdk iphoneos clang -dynamiclib -arch arm64 \
-            -isysroot $(xcrun -sdk iphoneos --show-sdk-path) \
-            -miphoneos-version-min=15.0 \
-            -framework Foundation \
-            -fobjc-arc -O2 \
-            PatchZQ.m -o libPatchZQ.dylib
-
-          install_name_tool -id "@executable_path/libPatchZQ.dylib" libPatchZQ.dylib
-          strip -x libPatchZQ.dylib
-          ls -lh libPatchZQ.dylib
-          file libPatchZQ.dylib
-
-          echo "=== 验证 __interpose 段 ==="
-          otool -l libPatchZQ.dylib | grep -A4 __interpose || echo "(未找到 __interpose 段！)"
-
-          echo "=== 导出符号 ==="
-          nm -gU libPatchZQ.dylib
-
-          echo "=== 依赖库 ==="
-          otool -L libPatchZQ.dylib
-
-      - name: Upload dylib
-        uses: actions/upload-artifact@v4
-        with:
-          name: libPatchZQ
-          path: libPatchZQ.dylib
-
-      - name: Release
-        if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: Build #${{ github.run_number }}
-          files: libPatchZQ.dylib
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check signing config
         id: check
         run: |
-          if [ -n "${{ secrets.P12_BASE64 }}" ] && [ -n "${{ secrets.IPA_URL }}" ]; then
+          if [ -n "${{ secrets.P12_BASE64 }}" ] && [ -n "${{ secrets.IPA_URL }}" ] && [ -n "${{ secrets.PROVISION_BASE64 }}" ]; then
             echo "has_sign_config=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_sign_config=false" >> "$GITHUB_OUTPUT"
-            echo "未配置签名 secrets，跳过重签名"
+            echo "未配置完整签名 secrets（需要 P12_BASE64, IPA_URL, PROVISION_BASE64）"
           fi
 
       - name: Download Original IPA
@@ -76,11 +36,10 @@ jobs:
           curl -L -o original.ipa "${{ secrets.IPA_URL }}"
           ls -lh original.ipa
 
-      - name: Clean Inject (零残留注入)
+      - name: Prepare Clean IPA
         if: steps.check.outputs.has_sign_config == 'true'
         run: |
-          # ---- 0. 绝对干净的工作区 ----
-          rm -rf Payload_Workspace Signed_Final.ipa
+          rm -rf Payload_Workspace
           unzip -q original.ipa -d Payload_Workspace
           APP_PATH=$(find Payload_Workspace/Payload -name "*.app" -maxdepth 1 | head -1)
           APP_BINARY=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || basename "$APP_PATH" .app)
@@ -88,96 +47,11 @@ jobs:
           echo "Binary: $APP_BINARY"
           echo "原 BundleID: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist" 2>/dev/null || echo 'unknown')"
 
-          # ---- 1. 暴力清理所有历史 PatchZQ 文件 ----
-          # 递归查找整个 .app 目录下任何包含 PatchZQ 的文件
-          echo ""
-          echo "=== 清理前 PatchZQ 相关文件 ==="
-          find "$APP_PATH" -iname "*patchzq*" -type f -print 2>/dev/null || echo "(无)"
+          # 清除所有历史 Dylib 注入残留（防止历史 IPA 中带了）
+          find "$APP_PATH" -iname "*patchzq*" -type f -delete 2>/dev/null || true
+          find "$APP_PATH" -iname "libpatch*" -type f -delete 2>/dev/null || true
 
-          find "$APP_PATH" -iname "*patchzq*" -type f -print -delete 2>/dev/null || true
-          find "$APP_PATH" -iname "libpatch*" -type f -print -delete 2>/dev/null || true
-
-          # 同时清理 Frameworks 下可能藏的 dylib
-          find "$APP_PATH/Frameworks" -iname "*patch*" -type f -print -delete 2>/dev/null || true
-
-          echo ""
-          echo "=== 清理后 PatchZQ 相关文件 ==="
-          find "$APP_PATH" -iname "*patchzq*" -type f -print 2>/dev/null || echo "(已清空)"
-
-          # ---- 2. 暴力清理所有 PatchZQ Load Command ----
-          # 先列出所有包含 patch 的 Load Command
-          echo ""
-          echo "=== 清理前 Load Command 中 PatchZQ 条目 ==="
-          otool -L "$APP_PATH/$APP_BINARY" | grep -i "patch" || echo "(无)"
-
-          # 尝试用 optool uninstall 移除所有可能的路径
-          # 覆盖各种可能的历史注入路径格式
-          for lc_path in \
-            "@executable_path/libPatchZQ.dylib" \
-            "@executable_path/Frameworks/libPatchZQ.dylib" \
-            "@rpath/libPatchZQ.dylib" \
-            "libPatchZQ.dylib" \
-            "@executable_path/libPatchZQ 2.dylib" \
-            "@executable_path/libPatchZQ 3.dylib" \
-            "@executable_path/libPatchZQ 4.dylib" \
-            "@executable_path/libPatchZQ 5.dylib" \
-            "@executable_path/libPatchZQ 6.dylib" \
-            "@executable_path/libPatchZQ 7.dylib" \
-            "@executable_path/libPatchZQ 8.dylib" \
-            "@executable_path/libPatchZQ 9.dylib" \
-            "@executable_path/Frameworks/libPatchZQ 2.dylib" \
-            "@executable_path/Frameworks/libPatchZQ 3.dylib" \
-            "@executable_path/Frameworks/libPatchZQ 4.dylib" \
-            "@loader_path/libPatchZQ.dylib"; do
-            optool uninstall -p "$lc_path" -t "$APP_PATH/$APP_BINARY" 2>/dev/null || true
-          done
-
-          echo ""
-          echo "=== 清理后 Load Command 中 PatchZQ 条目 ==="
-          otool -L "$APP_PATH/$APP_BINARY" | grep -i "patch" || echo "(已清空)"
-
-          # ---- 3. 剥离 ZSE.framework（如果存在）----
-          if [ -d "$APP_PATH/Frameworks/ZSE.framework" ]; then
-            echo ""
-            echo ">>> 剥离 ZSE.framework..."
-            python3 remove_dylib_dep.py "$APP_PATH/$APP_BINARY" "ZSE" || true
-            rm -rf "$APP_PATH/Frameworks/ZSE.framework"
-            echo "ZSE.framework 已删除"
-          fi
-
-          # ---- 4. 注入唯一干净 dylib ----
-          cp libPatchZQ.dylib "$APP_PATH/libPatchZQ.dylib"
-          optool install -c load \
-            -p "@executable_path/libPatchZQ.dylib" \
-            -t "$APP_PATH/$APP_BINARY"
-
-          # ---- 5. 严格验证注入结果（不通过则直接失败）----
-          echo ""
-          echo "=== 注入验证 ==="
-
-          LC_COUNT=$(otool -L "$APP_PATH/$APP_BINARY" | grep -ci "patchzq" || echo "0")
-          echo "PatchZQ Load Command 数量: $LC_COUNT"
-
-          FILE_COUNT=$(find "$APP_PATH" -iname "*patchzq*" -type f | wc -l)
-          echo "PatchZQ 文件数量: $FILE_COUNT"
-
-          if [ "$LC_COUNT" -ne 1 ]; then
-            echo "❌ 失败：Load Command 数量不为 1（当前: $LC_COUNT）"
-            echo "Load Command 详情："
-            otool -L "$APP_PATH/$APP_BINARY" | grep -i "patch"
-            exit 1
-          fi
-
-          if [ "$FILE_COUNT" -ne 1 ]; then
-            echo "❌ 失败：文件数量不为 1（当前: $FILE_COUNT）"
-            echo "文件列表："
-            find "$APP_PATH" -iname "*patchzq*" -type f
-            exit 1
-          fi
-
-          echo "✅ 注入验证通过：1 个 Load Command + 1 个 dylib 文件"
-
-          # ---- 6. 清理冲突组件 ----
+          # 清理个人证书无法签名的插件与扩展
           rm -rf "$APP_PATH/PlugIns"
           rm -rf "$APP_PATH/Watch"
           rm -rf "$APP_PATH/_CodeSignature"
@@ -186,10 +60,45 @@ jobs:
           find "$APP_PATH/Frameworks" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
 
           echo ""
-          echo "=== 最终目录大小 ==="
-          du -sh "$APP_PATH"
+          echo "=== 二进制信息 ==="
+          file "$APP_PATH/$APP_BINARY"
+          ls -lh "$APP_PATH/$APP_BINARY"
 
-      - name: Sign IPA with zsign (-b 强制原包名)
+      - name: Extract Team ID & Patch Mach-O (核心：静态二进制修补)
+        if: steps.check.outputs.has_sign_config == 'true'
+        env:
+          PROV_BASE64: ${{ secrets.PROVISION_BASE64 }}
+        run: |
+          echo "$PROV_BASE64" | base64 -d > profile.mobileprovision
+
+          # 从 .mobileprovision 中提取个人证书的真实 Team ID
+          TEAM_ID=$(security cms -D -i profile.mobileprovision 2>/dev/null | plutil -extract TeamIdentifier.0 raw - 2>/dev/null || echo "")
+          if [ -z "$TEAM_ID" ] || [ ${#TEAM_ID} -ne 10 ]; then
+            echo "❌ 无法从 mobileprovision 提取有效的 10 位 Team ID"
+            echo "Team ID: '$TEAM_ID' (长度: ${#TEAM_ID})"
+            # 尝试调试输出
+            echo ""
+            echo "=== mobileprovision 解码内容（前20行）==="
+            security cms -D -i profile.mobileprovision 2>/dev/null | head -20 || echo "解码失败"
+            exit 1
+          fi
+          echo "✅ 检测到个人证书 Team ID: $TEAM_ID"
+
+          APP_PATH=$(find Payload_Workspace/Payload -name "*.app" -maxdepth 1 | head -1)
+          APP_BINARY=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || basename "$APP_PATH" .app)
+
+          echo ""
+          echo "=== 开始静态二进制修补 ==="
+          python3 patch_macho.py "$APP_PATH/$APP_BINARY" "$TEAM_ID"
+
+          echo ""
+          echo "=== 修补后验证 ==="
+          echo "原 TeamID (7QW5G8QMV9) 剩余次数:"
+          grep -ao "7QW5G8QMV9" "$APP_PATH/$APP_BINARY" | wc -l || echo "0"
+          echo "新 TeamID ($TEAM_ID) 出现次数:"
+          grep -ao "$TEAM_ID" "$APP_PATH/$APP_BINARY" | wc -l || echo "0"
+
+      - name: Sign IPA with zsign
         if: steps.check.outputs.has_sign_config == 'true'
         env:
           P12_BASE64: ${{ secrets.P12_BASE64 }}
@@ -201,6 +110,7 @@ jobs:
 
           APP_PATH=$(find Payload_Workspace/Payload -name "*.app" -maxdepth 1 | head -1)
 
+          # 重签：锁定原包名 + 递归签名所有 Framework
           zsign -f -b "com.zhenqu.music" \
             -k cert.p12 -p "$P12_PASSWORD" -m profile.mobileprovision \
             -o Signed_Final.ipa "$APP_PATH"
@@ -211,5 +121,5 @@ jobs:
         if: steps.check.outputs.has_sign_config == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: Signed-Final-ZQMusic
+          name: Patched-Signed-ZQMusic
           path: Signed_Final.ipa
