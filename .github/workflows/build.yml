@@ -86,12 +86,26 @@ jobs:
           echo "原 BundleID: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist" 2>/dev/null || echo 'unknown')"
 
           echo ""
-          echo "=== Frameworks ==="
-          ls "$APP_PATH/Frameworks/" 2>/dev/null || echo "(none)"
-
-          # ---- 确认原始 IPA 干净：删除任何残留 PatchZQ ----
+          echo "=== 清理所有历史注入 ==="
+          # 删除所有历史 PatchZQ 文件（包括子目录）
           find "$APP_PATH" -name "*PatchZQ*" -type f -print -delete 2>/dev/null || true
           rm -f "$APP_PATH"/libPatchZQ*.dylib
+          # 删除所有带编号的历史 dylib（如 libPatchZQ 2.dylib, libPatchZQ 3.dylib 等）
+          find "$APP_PATH" -name "libPatchZQ*" -type f -print -delete 2>/dev/null || true
+
+          # 检查并清理已存在的 Load Command
+          echo "=== 清理旧 Load Command ==="
+          EXISTING_LC=$(otool -L "$APP_PATH/$APP_BINARY" | grep -ci "patchzq" || echo "0")
+          if [ "$EXISTING_LC" -gt 0 ]; then
+            echo "发现 $EXISTING_LC 个旧 PatchZQ Load Command，正在清理..."
+            # 用 optool uninstall 逐个移除
+            optool uninstall -p "@executable_path/libPatchZQ.dylib" -t "$APP_PATH/$APP_BINARY" 2>/dev/null || true
+            for i in 2 3 4 5 6 7 8 9; do
+              optool uninstall -p "@executable_path/libPatchZQ $i.dylib" -t "$APP_PATH/$APP_BINARY" 2>/dev/null || true
+            done
+          else
+            echo "原始 IPA 无 PatchZQ Load Command"
+          fi
 
           # ---- 剥离 ZSE.framework（如果存在）----
           if [ -d "$APP_PATH/Frameworks/ZSE.framework" ]; then
@@ -112,9 +126,15 @@ jobs:
 
           echo ""
           echo "=== 验证注入（确保只有一个 PatchZQ）==="
-          otool -L "$APP_PATH/$APP_BINARY" | grep -i patch || echo "(未找到 PatchZQ)"
-          PATCH_COUNT=$(find "$APP_PATH" -name "*PatchZQ*" -type f | wc -l)
-          echo "PatchZQ 文件数: $PATCH_COUNT"
+          LC_COUNT=$(otool -L "$APP_PATH/$APP_BINARY" | grep -ci "patchzq" || echo "0")
+          echo "PatchZQ Load Command 数: $LC_COUNT"
+          FILE_COUNT=$(find "$APP_PATH" -name "*PatchZQ*" -type f | wc -l)
+          echo "PatchZQ 文件数: $FILE_COUNT"
+          if [ "$LC_COUNT" -ne 1 ] || [ "$FILE_COUNT" -ne 1 ]; then
+            echo "错误：PatchZQ 注入异常！LC=$LC_COUNT FILE=$FILE_COUNT"
+            exit 1
+          fi
+          echo "注入验证通过：仅 1 个 Load Command + 1 个文件"
 
           # ---- 清理所有扩展和可能引发证书权限冲突的签名残留 ----
           rm -rf "$APP_PATH/PlugIns"
